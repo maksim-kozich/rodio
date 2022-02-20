@@ -45,6 +45,7 @@ struct NextSound<S> {
     pub sender: Option<Sender<()>>,
     pub priority: u8,
     pub add_time: SystemTime,
+    pub expiration_time: Option<SystemTime>,
 }
 
 impl<S> PartialOrd for NextSound<S> {
@@ -86,7 +87,7 @@ where
 {
     /// Adds a new source to the end of the queue.
     #[inline]
-    pub fn append<T>(&self, source: T, priority: u8)
+    pub fn append<T>(&self, source: T, priority: Option<u8>, maximum_delay: Option<Duration>)
     where
         T: Source<Item = S> + Send + 'static,
     {
@@ -96,8 +97,11 @@ where
             .push(NextSound {
                 source: Box::new(source) as Box<_>,
                 sender: None,
-                priority,
+                priority: priority.unwrap_or_default(),
                 add_time: SystemTime::now(),
+                expiration_time: maximum_delay.and_then(|delay| {
+                    SystemTime::now().checked_add(delay)
+                })
             });
     }
 
@@ -105,7 +109,7 @@ where
     ///
     /// The `Receiver` will be signalled when the sound has finished playing.
     #[inline]
-    pub fn append_with_signal<T>(&self, source: T, priority: u8) -> Receiver<()>
+    pub fn append_with_signal<T>(&self, source: T, priority: Option<u8>, maximum_delay: Option<Duration>) -> Receiver<()>
     where
         T: Source<Item = S> + Send + 'static,
     {
@@ -116,8 +120,11 @@ where
             .push(NextSound {
                 source: Box::new(source) as Box<_>,
                 sender: Some(tx),
-                priority,
+                priority: priority.unwrap_or_default(),
                 add_time: SystemTime::now(),
+                expiration_time: maximum_delay.and_then(|delay| {
+                    SystemTime::now().checked_add(delay)
+                })
             });
         rx
     }
@@ -240,21 +247,37 @@ where
         let (next, signal_after_end) = {
             let mut next = self.input.next_sounds.lock().unwrap();
 
-            if next.len() == 0 {
-                if self.input.keep_alive_if_empty.load(Ordering::Acquire) {
-                    // Play a short silence in order to avoid spinlocking.
-                    let silence = Zero::<S>::new(1, 44100); // TODO: meh
-                    (
-                        Box::new(silence.take_duration(Duration::from_millis(10))) as Box<_>,
-                        None,
-                    )
-                } else {
-                    return Err(());
+
+            let source;
+            let sender;
+            loop {
+                match next.pop() {
+                    Some(sound) => {
+                        let is_expired = sound.expiration_time
+                            .map(|expiration_time| SystemTime::now().gt(&expiration_time))
+                            .unwrap_or(false);
+                        if !is_expired {
+                            source = sound.source;
+                            sender = sound.sender;
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => {
+                        if self.input.keep_alive_if_empty.load(Ordering::Acquire) {
+                            // Play a short silence in order to avoid spinlocking.
+                            let silence = Zero::<S>::new(1, 44100); // TODO: meh
+                            source = Box::new(silence.take_duration(Duration::from_millis(10))) as Box<_>;
+                            sender = None;
+                            break;
+                        } else {
+                            return Err(());
+                        }
+                    }
                 }
-            } else {
-                let next_sound = next.pop().unwrap();
-                (next_sound.source, next_sound.sender)
             }
+            (source, sender)
         };
 
         self.current = next;
@@ -274,9 +297,9 @@ mod tests {
     fn basic() {
         let (tx, mut rx) = priority_queue::priority_queue(false);
 
-        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), 0);
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
         std::thread::sleep(Duration::from_millis(10));
-        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), 0);
+        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), None, None);
 
         // assert_eq!(rx.channels(), 1);
         // assert_eq!(rx.sample_rate(), 48000);
@@ -298,9 +321,9 @@ mod tests {
     fn basic_with_priority() {
         let (tx, mut rx) = priority_queue::priority_queue(false);
 
-        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), 0);
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), Some(0), None);
         std::thread::sleep(Duration::from_millis(10));
-        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), 1);
+        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), Some(1), None);
 
         // assert_eq!(rx.channels(), 2);
         // assert_eq!(rx.sample_rate(), 96000);
@@ -322,8 +345,8 @@ mod tests {
     fn basic_same_time() {
         let (tx, mut rx) = priority_queue::priority_queue(false);
 
-        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), 0);
-        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), 0);
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
+        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), None, None);
 
         // assert_eq!(rx.channels(), 1);
         // assert_eq!(rx.sample_rate(), 48000);
@@ -341,6 +364,48 @@ mod tests {
     }
 
     #[test]
+    // #[ignore] // FIXME: samples rate and channel not updated immediately after transition
+    fn basic_ttl_ok() {
+        let (tx, mut rx) = priority_queue::priority_queue(false);
+
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
+        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), None, Some(Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(10));
+
+        // assert_eq!(rx.channels(), 1);
+        // assert_eq!(rx.sample_rate(), 48000);
+        assert_eq!(rx.next(), Some(10));
+        assert_eq!(rx.next(), Some(-10));
+        assert_eq!(rx.next(), Some(10));
+        assert_eq!(rx.next(), Some(-10));
+        // assert_eq!(rx.channels(), 2);
+        // assert_eq!(rx.sample_rate(), 96000);
+        assert_eq!(rx.next(), Some(5));
+        assert_eq!(rx.next(), Some(5));
+        assert_eq!(rx.next(), Some(5));
+        assert_eq!(rx.next(), Some(5));
+        assert_eq!(rx.next(), None);
+    }
+
+    #[test]
+    // #[ignore] // FIXME: samples rate and channel not updated immediately after transition
+    fn basic_ttl_expired() {
+        let (tx, mut rx) = priority_queue::priority_queue(false);
+
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
+        tx.append(SamplesBuffer::new(2, 96000, vec![5i16, 5, 5, 5]), None, Some(Duration::from_millis(5)));
+        std::thread::sleep(Duration::from_millis(10));
+
+        // assert_eq!(rx.channels(), 1);
+        // assert_eq!(rx.sample_rate(), 48000);
+        assert_eq!(rx.next(), Some(10));
+        assert_eq!(rx.next(), Some(-10));
+        assert_eq!(rx.next(), Some(10));
+        assert_eq!(rx.next(), Some(-10));
+        assert_eq!(rx.next(), None);
+    }
+
+    #[test]
     fn immediate_end() {
         let (_, mut rx) = priority_queue::priority_queue::<i16>(false);
         assert_eq!(rx.next(), None);
@@ -349,7 +414,7 @@ mod tests {
     #[test]
     fn keep_alive() {
         let (tx, mut rx) = priority_queue::priority_queue(true);
-        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), 0);
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
 
         assert_eq!(rx.next(), Some(10));
         assert_eq!(rx.next(), Some(-10));
@@ -370,7 +435,7 @@ mod tests {
             assert_eq!(rx.next(), Some(0));
         }
 
-        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), 0);
+        tx.append(SamplesBuffer::new(1, 48000, vec![10i16, -10, 10, -10]), None, None);
         assert_eq!(rx.next(), Some(10));
         assert_eq!(rx.next(), Some(-10));
         assert_eq!(rx.next(), Some(10));
